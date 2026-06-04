@@ -57,9 +57,14 @@ export interface TimelineRequest {
 }
 
 export interface TimelineResponse {
-  timeline: string;
+  timeline: TimelineEntry[];
   event_count: number;
   status: string;
+}
+
+export interface TimelineEntry {
+  date: string;
+  event: string;
 }
 
 // --- Voice Assistant ---

@@ -42,8 +42,11 @@ class VoiceService:
         # Run through the existing legal pipeline
         result = await self._pipeline.ask_legal_question(cleaned, language=language)
 
+        # Ensure voice responses do not contain Markdown markup
+        from app.utils.text_processing import strip_markdown
+
         return {
-            "answer": result.get("answer", ""),
+            "answer": strip_markdown(result.get("answer", "")),
             "source": result.get("source", ""),
             "method": result.get("method", "error"),
             "confidence": result.get("confidence"),

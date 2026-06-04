@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTimeline } from "../../hooks/useTimeline";
 import { useDocumentStore } from "../../stores/document-store";
 import { LoadingSpinner } from "../common/LoadingSpinner";
@@ -10,13 +10,30 @@ export function TimelineGenerator() {
   const [selectedDoc, setSelectedDoc] = useState<string>("");
 
   const completedDocs = results.filter(
-    (r) => r.status === "completed" && r.extracted_text
+    (r) => r.status === "completed" && r.raw_text
   );
+  const activeDoc = completedDocs.find((doc) => doc.file_id === selectedDoc) ?? completedDocs[0] ?? null;
+
+  useEffect(() => {
+    if (completedDocs.length === 0) {
+      setSelectedDoc("");
+      return;
+    }
+
+    const firstDoc = completedDocs[0];
+    if (!selectedDoc || !completedDocs.some((doc) => doc.file_id === selectedDoc)) {
+      setSelectedDoc(firstDoc.file_id);
+    }
+  }, [completedDocs, selectedDoc]);
+
+  useEffect(() => {
+    if (!activeDoc?.raw_text) return;
+    mutate({ documentText: activeDoc.raw_text, language });
+  }, [activeDoc?.file_id, activeDoc?.raw_text, language, mutate]);
 
   const handleGenerate = () => {
-    const doc = completedDocs.find((d) => d.file_id === selectedDoc);
-    if (!doc?.extracted_text) return;
-    mutate({ documentText: doc.extracted_text, language });
+    if (!activeDoc?.raw_text) return;
+    mutate({ documentText: activeDoc.raw_text, language });
   };
 
   return (
@@ -53,9 +70,9 @@ export function TimelineGenerator() {
               title="Select a document for timeline"
             >
               <option value="">Select a document…</option>
-              {completedDocs.map((doc) => (
+              {completedDocs.map((doc, index) => (
                 <option key={doc.file_id} value={doc.file_id}>
-                  {doc.filename}
+                  Document {index + 1}
                 </option>
               ))}
             </select>

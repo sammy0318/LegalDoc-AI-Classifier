@@ -4,6 +4,7 @@ from app.services.llm_service import check_llm_connection, get_llm_provider
 from app.services.retrieval_service import RetrievalService
 from app.services.context_service import ContextService
 from app.config import Settings
+from app.utils.text_processing import strip_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,19 @@ class JudgementService:
 
         llm_available = await check_llm_connection(self._settings)
         if not llm_available:
+            # Provide a deterministic fallback prediction when LLM is unavailable
+            logger.warning("LLM unavailable, returning fallback judgement prediction")
+            disclaimer = (
+                "अस्वीकरण: यह AI-जनित भविष्यवाणी है और इसे पेशेवर कानूनी सलाह नहीं माना जाना चाहिए।"
+                if language == "hi"
+                else "Disclaimer: This is an AI-generated prediction and should not be considered professional legal advice. Always consult a qualified legal professional for actual case guidance."
+            )
             return {
-                "prediction": "AI engine is currently unavailable for judgement prediction.",
+                "prediction": self._fallback_prediction(case_description, case_type, language, relevant_section_names),
                 "relevant_sections": relevant_section_names,
-                "confidence_level": "none",
-                "disclaimer": "",
-                "status": "unavailable",
+                "confidence_level": "low",
+                "disclaimer": disclaimer,
+                "status": "fallback",
             }
 
         llm = get_llm_provider(self._settings)
@@ -123,12 +131,18 @@ class JudgementService:
             result = await llm.generate_answer(prompt, system_message=system_message)
         except Exception as exc:
             logger.error("Judgement prediction LLM call failed: %s", exc)
+            # On LLM failure, return a conservative non-LLM fallback prediction
+            disclaimer = (
+                "अस्वीकरण: यह AI-जनित भविष्यवाणी है और इसे पेशेवर कानूनी सलाह नहीं माना जाना चाहिए।"
+                if language == "hi"
+                else "Disclaimer: This is an AI-generated prediction and should not be considered professional legal advice. Always consult a qualified legal professional for actual case guidance."
+            )
             return {
-                "prediction": "Failed to generate prediction due to an AI processing error.",
+                "prediction": self._fallback_prediction(case_description, case_type, language, relevant_section_names),
                 "relevant_sections": relevant_section_names,
-                "confidence_level": "none",
-                "disclaimer": "",
-                "status": "error",
+                "confidence_level": "low",
+                "disclaimer": disclaimer,
+                "status": "fallback",
             }
 
         if not result or not result.strip():
@@ -156,10 +170,37 @@ class JudgementService:
             "Always consult a qualified legal professional for actual case guidance."
         )
 
+        # Strip markdown from LLM-generated answer to avoid raw markup in UI
+        clean_prediction = strip_markdown(result.strip())
         return {
-            "prediction": result.strip(),
+            "prediction": clean_prediction,
             "relevant_sections": relevant_section_names,
             "confidence_level": confidence_level,
             "disclaimer": disclaimer,
             "status": "completed",
         }
+
+    def _fallback_prediction(
+        self,
+        case_description: str,
+        case_type: str,
+        language: str,
+        relevant_section_names: list,
+    ) -> str:
+        """Generate a short, deterministic fallback prediction when LLM is unavailable.
+
+        This uses available retrieved section names and simple heuristics to produce
+        a helpful message rather than a hard error.
+        """
+        sections = ", ".join(relevant_section_names) if relevant_section_names else "no specific provisions found"
+        if language == "hi":
+            pred = (
+                f"AI इंजन उपलब्ध नहीं था। उपलब्ध कानूनी प्रावधान: {sections}।\n"
+                "प्रस्तावित निष्कर्ष: तथ्य और साक्ष्यों पर निर्भर करता है; वर्तमान जानकारी के आधार पर स्पष्ट निर्णय कहना कठिन है।"
+            )
+        else:
+            pred = (
+                f"AI engine was unavailable. Relevant legal provisions: {sections}.\n"
+                "Conservative assessment: outcome is uncertain and will depend on evidence strength and applicable precedents."
+            )
+        return pred

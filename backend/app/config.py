@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 from pathlib import Path
 
@@ -47,4 +47,8 @@ class Settings(BaseSettings):
         if not self.QA_DIR.exists():
             raise ValueError(f"QA directory not found: {self.QA_DIR}")
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        enable_decoding=False,
+    )

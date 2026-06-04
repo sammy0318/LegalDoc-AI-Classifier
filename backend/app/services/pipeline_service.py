@@ -6,6 +6,7 @@ from app.services.context_service import ContextService
 from app.services.llm_service import check_llm_connection, get_llm_provider
 from app.services.prompt_service import PromptService
 from app.config import Settings
+from app.utils.text_processing import strip_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class PipelineService:
                         translated = await llm.generate_answer(translate_prompt, system_message=system_msg)
                         if translated and translated.strip():
                             return {
-                                "answer": translated,
+                                "answer": strip_markdown(translated),
                                 "source": qa_result["source"],
                                 "method": "qa_dataset",
                                 "confidence": qa_result["confidence"],
@@ -59,7 +60,7 @@ class PipelineService:
                     except Exception:
                         pass  # Fall through to return English QA answer
             return {
-                "answer": qa_result["answer"],
+                "answer": strip_markdown(qa_result["answer"]),
                 "source": qa_result["source"],
                 "method": "qa_dataset",
                 "confidence": qa_result["confidence"],
@@ -72,7 +73,7 @@ class PipelineService:
                    if language == "hi" else
                    "No relevant legal provision was found for this query in the available Acts.")
             return {
-                "answer": msg,
+                "answer": strip_markdown(msg),
                 "source": "acts",
                 "method": "fallback",
             }
@@ -96,7 +97,7 @@ class PipelineService:
                     if language == "hi" else
                     "⚠ AI engine is currently unavailable. Showing legal text-based information only:\n\n")
             return {
-                "answer": note + context,
+                "answer": strip_markdown(note + context),
                 "source": "acts",
                 "method": "no_llm",
             }
@@ -108,12 +109,10 @@ class PipelineService:
             llm_answer = await llm.generate_answer(prompt, system_message=system_message)
         except Exception as exc:
             logger.error("LLM generate_answer failed: %s", exc)
-            note = ("⚠ AI मॉडल से उत्तर प्राप्त करने में त्रुटि हुई। नीचे कानूनी पाठ दिया गया है:\n\n"
-                    if language == "hi" else "")
             return {
-                "answer": note + context if language == "hi" else context,
+                "answer": strip_markdown(("⚠ AI मॉडल से उत्तर प्राप्त करने में त्रुटि हुई।" if language == "hi" else "The AI model failed to generate a response.")),
                 "source": "acts",
-                "method": "fallback",
+                "method": "error",
             }
 
         if not llm_answer or not llm_answer.strip():
@@ -121,14 +120,14 @@ class PipelineService:
                    if language == "hi" else
                    "The AI model could not generate a reliable answer from the provided legal context.")
             return {
-                "answer": msg,
+                "answer": strip_markdown(msg),
                 "source": "llm",
                 "method": "fallback",
             }
 
         # Step 6: Final successful response
         return {
-            "answer": llm_answer,
+            "answer": strip_markdown(llm_answer),
             "source": "LLM + Legal Acts",
             "method": "llm",
         }

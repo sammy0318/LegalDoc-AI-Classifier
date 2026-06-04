@@ -74,13 +74,18 @@ class SummaryResponse(BaseModel):
 
 # --- Timeline Generator models ---
 
+
+class TimelineEntry(BaseModel):
+    date: str
+    event: str
+
 class TimelineRequest(BaseModel):
     document_text: str = Field(..., min_length=1, max_length=50000)
     language: str = Field(default="en", pattern="^(en|hi)$")
 
 
 class TimelineResponse(BaseModel):
-    timeline: str
+    timeline: list[TimelineEntry]
     event_count: int
     status: str
 

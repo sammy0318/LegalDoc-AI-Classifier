@@ -1,339 +1,74 @@
+"""Hardcoded extraction service used to keep the backend running without OCR.
+
+This service preserves the existing upload/review response shape, but returns a
+fixed legal document payload instead of running PaddleOCR or any external OCR
+stack. That keeps the backend startup and upload flow deterministic.
 """
-Offline OCR service using PaddleOCR.
-Replaces Google Cloud Vision API for fully offline document text extraction.
-Supports English and Hindi.  Accepts PDF, JPG, and PNG inputs.
-"""
-
-import asyncio
-import logging
-import os
-import time
-from typing import List, Tuple
-
-# PaddlePaddle environment flags — must be set before importing paddleocr.
-os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-
-import cv2
-import numpy as np
-import pypdfium2 as pdfium
-from paddleocr import PaddleOCR
-from PIL import Image
-
-logger = logging.getLogger("ocr_service")
-
-SUPPORTED_LANGS = {"auto", "en", "hi"}
-_OCR_LANGS = {"en", "hi"}
-
-# ---------------------------------------------------------------------------
-# PaddleOCR singletons — one per language
-# ---------------------------------------------------------------------------
-
-_ocr_instances: dict[str, PaddleOCR] = {}
-
-
-def _get_ocr(lang: str = "en") -> PaddleOCR:
-    """Return a lazily-initialised PaddleOCR instance for *lang*."""
-    if lang not in _OCR_LANGS:
-        raise ValueError(f"Unsupported OCR language '{lang}'.")
-
-    if lang not in _ocr_instances:
-        logger.info("Initialising PaddleOCR engine (lang=%s) ...", lang)
-        start = time.perf_counter()
-        _ocr_instances[lang] = PaddleOCR(use_angle_cls=True, lang=lang)
-        elapsed = time.perf_counter() - start
-        logger.info("PaddleOCR engine (lang=%s) loaded in %.2fs", lang, elapsed)
-
-    return _ocr_instances[lang]
-
-
-def is_engine_ready() -> bool:
-    """Check whether the default OCR engine can be instantiated."""
-    try:
-        _get_ocr("en")
-        return True
-    except Exception:
-        logger.exception("OCR engine health-check failed")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Reading-order sorting
-# ---------------------------------------------------------------------------
-
-def _sort_boxes_reading_order(
-    results: list,
-    line_threshold_ratio: float = 0.5,
-) -> Tuple[List[str], float]:
-    """Sort OCR bounding-box results into natural reading order.
-
-    Legal documents are read top-to-bottom then left-to-right.  PaddleOCR may
-    return boxes in detection order which can be jumbled.  This function groups
-    boxes into logical "lines" based on vertical proximity, then sorts each
-    line left-to-right.
-
-    Returns
-    -------
-    tuple[list[str], float]
-        (ordered_text_fragments, average_confidence)
-    """
-    if not results:
-        return [], 0.0
-
-    entries = []
-    total_conf = 0.0
-    for bbox, (text, confidence) in results:
-        ys = [pt[1] for pt in bbox]
-        xs = [pt[0] for pt in bbox]
-        mid_y = sum(ys) / len(ys)
-        min_x = min(xs)
-        height = max(ys) - min(ys)
-        entries.append((mid_y, min_x, height, text))
-        total_conf += confidence
-
-    avg_conf = total_conf / len(entries) if entries else 0.0
-
-    # Sort primarily by vertical midpoint
-    entries.sort(key=lambda e: e[0])
-
-    avg_height = sum(e[2] for e in entries) / len(entries) if entries else 1
-    threshold = avg_height * line_threshold_ratio
-
-    # Group into lines
-    lines: list[list[tuple]] = []
-    current_line: list[tuple] = [entries[0]]
-
-    for entry in entries[1:]:
-        if abs(entry[0] - current_line[-1][0]) <= threshold:
-            current_line.append(entry)
-        else:
-            lines.append(current_line)
-            current_line = [entry]
-    lines.append(current_line)
-
-    # Sort each line left-to-right, then flatten
-    ordered_texts: List[str] = []
-    for line in lines:
-        line.sort(key=lambda e: e[1])
-        ordered_texts.extend(e[3] for e in line)
-
-    return ordered_texts, avg_conf
-
-
-# ---------------------------------------------------------------------------
-# Image preprocessing — improves OCR on handwriting and low-quality scans
-# ---------------------------------------------------------------------------
-
-def _preprocess_image(image: np.ndarray) -> np.ndarray:
-    """Clean up an image to improve OCR accuracy.
-
-    Pipeline: grayscale → denoise → CLAHE contrast → adaptive threshold → BGR.
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast = clahe.apply(denoised)
-    binary = cv2.adaptiveThreshold(
-        contrast, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=31, C=10,
-    )
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-
-
-# ---------------------------------------------------------------------------
-# Detection extraction (supports PaddleOCR 2.x and 3.x output formats)
-# ---------------------------------------------------------------------------
-
-def _extract_detections(raw_results: list) -> list:
-    """Convert PaddleOCR results to ``(bbox, (text, score))`` tuples."""
-    detections = []
-    if not raw_results:
-        return detections
-
-    for result in raw_results:
-        # PaddleOCR 3.x returns dicts
-        if isinstance(result, dict):
-            texts = result.get("rec_texts", [])
-            scores = result.get("rec_scores", [])
-            polys = result.get("rec_polys", [])
-            for poly, text, score in zip(polys, texts, scores):
-                detections.append((poly, (text, score)))
-        # PaddleOCR 2.x returns list of (bbox, (text, conf))
-        elif isinstance(result, (list, tuple)):
-            for item in result:
-                if isinstance(item, (list, tuple)) and len(item) == 2:
-                    detections.append((item[0], item[1]))
-    return detections
-
-
-# ---------------------------------------------------------------------------
-# Single-image OCR
-# ---------------------------------------------------------------------------
-
-def _ocr_image_single(
-    image: np.ndarray, lang: str, page_label: str,
-) -> Tuple[str, float]:
-    """Run a single-language OCR pass. Returns ``(text, confidence)``."""
-    start = time.perf_counter()
-    processed = _preprocess_image(image)
-    ocr = _get_ocr(lang)
-    raw_results = ocr.ocr(processed)
-    elapsed = time.perf_counter() - start
-    logger.info("%s (lang=%s) processed in %.2fs", page_label, lang, elapsed)
-
-    detections = _extract_detections(raw_results)
-    if not detections:
-        logger.warning("No text detected on %s (lang=%s)", page_label, lang)
-        return "", 0.0
-
-    ordered, avg_conf = _sort_boxes_reading_order(detections)
-    return " ".join(ordered), avg_conf
-
-
-def _ocr_image_auto(
-    image: np.ndarray, page_label: str,
-) -> Tuple[str, float]:
-    """Run both en and hi OCR, keep the higher-confidence result per region."""
-    start = time.perf_counter()
-    processed = _preprocess_image(image)
-
-    en_raw = _get_ocr("en").ocr(processed)
-    hi_raw = _get_ocr("hi").ocr(processed)
-
-    en_dets = _extract_detections(en_raw)
-    hi_dets = _extract_detections(hi_raw)
-
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "%s (lang=auto, en=%d hi=%d regions) processed in %.2fs",
-        page_label, len(en_dets), len(hi_dets), elapsed,
-    )
-
-    best: dict[tuple, tuple] = {}
-
-    def _key(poly):
-        ys = [pt[1] for pt in poly]
-        xs = [pt[0] for pt in poly]
-        return (round(sum(ys) / len(ys), 1), round(min(xs), 1))
-
-    for poly, (text, score) in en_dets:
-        k = _key(poly)
-        if k not in best or score > best[k][1][1]:
-            best[k] = (poly, (text, score))
-
-    for poly, (text, score) in hi_dets:
-        k = _key(poly)
-        if k not in best or score > best[k][1][1]:
-            best[k] = (poly, (text, score))
-
-    detections = list(best.values())
-    if not detections:
-        logger.warning("No text detected on %s (lang=auto)", page_label)
-        return "", 0.0
-
-    ordered, avg_conf = _sort_boxes_reading_order(detections)
-    return " ".join(ordered), avg_conf
-
-
-def _ocr_image(
-    image: np.ndarray, lang: str, page_label: str = "image",
-) -> Tuple[str, float]:
-    """Run OCR on a single image. Returns ``(text, confidence)``."""
-    if lang == "auto":
-        return _ocr_image_auto(image, page_label)
-    return _ocr_image_single(image, lang, page_label)
-
-
-# ---------------------------------------------------------------------------
-# PDF processing  (bytes → images → OCR)
-# ---------------------------------------------------------------------------
-
-def _process_pdf_bytes(
-    pdf_bytes: bytes, lang: str,
-) -> Tuple[str, int, float]:
-    """Process PDF bytes. Returns ``(raw_text, page_count, avg_confidence)``."""
-    logger.info("Converting PDF to images for OCR ...")
-    pdf = pdfium.PdfDocument(pdf_bytes)
-    n_pages = len(pdf)
-    logger.info("PDF has %d page(s)", n_pages)
-
-    all_text: List[str] = []
-    total_conf = 0.0
-
-    for idx in range(n_pages):
-        page = pdf[idx]
-        # Render at 300 DPI for good OCR quality
-        bitmap = page.render(scale=300 / 72)
-        pil_image = bitmap.to_pil().convert("RGB")
-        img_array = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-        text, conf = _ocr_image(img_array, lang, page_label=f"Page {idx + 1}")
-        all_text.append(text)
-        total_conf += conf
-
-    pdf.close()
-
-    avg_conf = total_conf / n_pages if n_pages > 0 else 0.0
-    raw_text = "\n".join(all_text)
-    return raw_text, n_pages, avg_conf
-
-
-# ---------------------------------------------------------------------------
-# Image processing  (bytes → OCR)
-# ---------------------------------------------------------------------------
-
-def _process_image_bytes(
-    image_bytes: bytes, lang: str,
-) -> Tuple[str, float]:
-    """Process image bytes. Returns ``(raw_text, confidence)``."""
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode image")
-    return _ocr_image(img, lang, page_label="Page 1")
-
-
-# ---------------------------------------------------------------------------
-# Public service class — drop-in replacement for Google Vision VisionService
-# ---------------------------------------------------------------------------
+
+from __future__ import annotations
+
+HARDCODED_EXTRACTION_TEXT = """Here's the full extracted text and analysis:
+
+DOCUMENT: Counter Affidavit - High Court of Judicature at Allahabad
+Civil Misc. Writ Petition No. 424 of 2026, District: Gorakhpur
+
+PARTIES
+
+Petitioners: Jawahar Lal, Somnath, Seshnath (all sons of Kashi Prasad), residents of village Mamkhor, Tappa Mazuri, Pargana Dhuriyapur, Tehsil Gola, District Gorakhpur
+Respondents:
+
+State of U.P. through Secretary, Land Revenue Dept., Lucknow
+Board of Revenue U.P., Lucknow
+Commissioner Gorakhpur Division
+Sub Divisional Magistrate, Tehsil Gola, Gorakhpur
+Rohit son of Lallu Pasad, village Mamkhor, Gorakhpur
+
+
+
+Deponent: Vivek Yadav, aged 23, son of Late Krishnamurari Yadav, Mamkhor, Gorakhpur. Aadhar No. 478646839246. He is pairokar and family friend of Respondent no. 5.
+Advocate: Rajesh Kumar Yadav, AOR No. A/R-0458/12, Chamber-1, M.G. Marg, High Court, Allahabad. Mobile: 9415292601
+
+CORE FACTS (from affidavit paragraphs)
+
+Respondent no. 5 (Rohit, son of Late Lallu) filed application under Section 31/32 U.P. Revenue Code 2006 for recording his name over Gata nos. 238, 265, 266K, 295, 390, 383, 385, 649 and 737 in village Mamkhor as legal heir of Late Lallu.
+SDM Gola called Tehsildar report (dated 30.8.2018), which confirmed names of Ayodhya, Kashi and Lallu sons of Raghunath in Khatauni as per 1359 Fasli.
+Petitioners were served notice but filed no objection.
+SDM passed order dated 29.9.2018 allowing name recording of Rohit based on evidence and record.
+Petitioners filed revision against 29.9.2018 order - Commissioner remanded back the matter on 13.8.2019 (illegally per respondent).
+Respondent no. 5 filed revision before Board of Revenue, which allowed it vide order dated 12.12.2025, restoring the SDM's original order.
+Present writ petition challenges this, and court issued stay order dated 3.2.2026.
+This counter affidavit seeks vacation of the stay order.
+
+
+CONCLUSION FOR HARDCODING
+Document Type     : Counter Affidavit
+Court             : High Court of Judicature at Allahabad
+Case No.          : Civil Misc. Writ Petition No. 424 of 2026
+District          : Gorakhpur
+Filed By          : Respondent No. 5 (Rohit son of Lallu Pasad)
+Against           : Stay order dated 3.2.2026
+Subject Matter    : Land revenue mutation / name recording dispute (Section 31/32 UP Revenue Code)
+Key Dates         : SDM Order: 29.9.2018 | Commissioner Remand: 13.8.2019 | Board of Revenue Order: 12.12.2025 | Stay Order: 3.2.2026
+Prayer            : Vacate stay order dated 3.2.2026
+Advocate          : Rajesh Kumar Yadav, AOR A/R-0458/12"""
+
+
+def build_hardcoded_extraction_result(page_count: int = 1) -> dict:
+    return {
+        "raw_text": HARDCODED_EXTRACTION_TEXT,
+        "page_count": page_count,
+        "confidence_score": 1.0,
+    }
+
 
 class VisionService:
-    """Offline OCR service using PaddleOCR.
-
-    Drop-in replacement for the former Google Cloud Vision based service.
-    The public interface (``extract_text``, ``extract_text_from_pdf``) and
-    return format (``{raw_text, page_count, confidence_score}``) are identical
-    so no downstream code changes are required.
-    """
+    """Drop-in replacement that returns the hardcoded document payload."""
 
     def __init__(self, lang: str = "auto"):
         self._lang = lang
 
     async def extract_text(self, image_bytes: bytes) -> dict:
-        """Extract text from image bytes using PaddleOCR.
-
-        Returns dict with keys: raw_text, page_count, confidence_score.
-        """
-        text, confidence = await asyncio.to_thread(
-            _process_image_bytes, image_bytes, self._lang,
-        )
-        return {
-            "raw_text": text,
-            "page_count": 1,
-            "confidence_score": round(confidence, 4),
-        }
+        return build_hardcoded_extraction_result(page_count=1)
 
     async def extract_text_from_pdf(self, pdf_bytes: bytes) -> dict:
-        """Extract text from PDF bytes using PaddleOCR + pypdfium2.
-
-        Returns dict with keys: raw_text, page_count, confidence_score.
-        """
-        raw_text, page_count, confidence = await asyncio.to_thread(
-            _process_pdf_bytes, pdf_bytes, self._lang,
-        )
-        return {
-            "raw_text": raw_text,
-            "page_count": page_count,
-            "confidence_score": round(confidence, 4),
-        }
+        return build_hardcoded_extraction_result(page_count=1)

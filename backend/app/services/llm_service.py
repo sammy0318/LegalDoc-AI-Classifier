@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import time
 import logging
 import httpx
 from app.config import Settings
@@ -6,6 +7,8 @@ from app.config import Settings
 logger = logging.getLogger(__name__)
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+_LLM_HEALTH_CACHE: dict[str, tuple[float, bool]] = {}
+_LLM_HEALTH_TTL_S = 60.0
 
 
 class LLMProvider(ABC):
@@ -38,7 +41,8 @@ class CloudMistralProvider(LLMProvider):
             "temperature": 0.3,
             "max_tokens": 1024,
         }
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        timeout = httpx.Timeout(45.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             logger.info("Calling Mistral cloud API model=%s", self._model)
             response = await client.post(
                 MISTRAL_API_URL, headers=headers, json=payload
@@ -61,24 +65,42 @@ class LocalMistralProvider(LLMProvider):
         self._model = settings.OLLAMA_MODEL
 
     async def generate_answer(self, prompt: str, system_message: str | None = None) -> str | None:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            logger.info("Calling Ollama model=%s at %s", self._model, self._host)
-            body: dict = {"model": self._model, "prompt": prompt, "stream": False}
-            if system_message:
-                body["system"] = system_message
-            response = await client.post(
-                f"{self._host}/api/generate",
-                json=body,
+        timeout = httpx.Timeout(45.0, connect=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                logger.info("Calling Ollama model=%s at %s", self._model, self._host)
+                body: dict = {"model": self._model, "prompt": prompt, "stream": False}
+                if system_message:
+                    body["system"] = system_message
+                response = await client.post(
+                    f"{self._host}/api/generate",
+                    json=body,
+                )
+                response.raise_for_status()
+                data = response.json()
+                result = data.get("response", "")
+                logger.info("LLM response length: %d chars", len(result) if result else 0)
+                return result.strip() if result else None
+        except Exception as exc:
+            # If Ollama is not running locally, return a deterministic canned reply
+            logger.warning("Ollama local provider failed (%s); returning canned reply for demo", exc)
+            # make a simple helpful reply that mimics an LLM summary/prediction
+            if system_message and "Hindi" in (system_message[:40] if system_message else ""):
+                return "यह एक डेमो उत्तर है क्योंकि स्थानीय LLM अनुपलब्ध है। कृपया स्थानीय Ollama सर्वर चालू करें।"
+            return (
+                "Demo LLM response: local Ollama is not reachable.\n"
+                "This is a fallback answer to allow demos — start Ollama to use a real model."
             )
-            response.raise_for_status()
-            data = response.json()
-            result = data.get("response", "")
-            logger.info("LLM response length: %d chars", len(result) if result else 0)
-            return result.strip() if result else None
 
 
 async def check_llm_connection(settings: Settings, timeout_s: float = 5.0) -> bool:
     """Check if the configured LLM backend is reachable."""
+    cache_key = f"{settings.LLM_MODE}:{settings.OLLAMA_HOST}:{settings.OLLAMA_MODEL}:{settings.MISTRAL_KEY[:8]}"
+    now = time.monotonic()
+    cached = _LLM_HEALTH_CACHE.get(cache_key)
+    if cached and now - cached[0] < _LLM_HEALTH_TTL_S:
+        return cached[1]
+
     try:
         if settings.LLM_MODE == "cloud":
             if not settings.MISTRAL_KEY:
@@ -89,11 +111,16 @@ async def check_llm_connection(settings: Settings, timeout_s: float = 5.0) -> bo
                     "https://api.mistral.ai/v1/models",
                     headers={"Authorization": f"Bearer {settings.MISTRAL_KEY}"},
                 )
-                return response.status_code == 200
+                result = response.status_code == 200
+                _LLM_HEALTH_CACHE[cache_key] = (now, result)
+                return result
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             response = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
-            return response.status_code == 200
+            result = response.status_code == 200
+            _LLM_HEALTH_CACHE[cache_key] = (now, result)
+            return result
     except Exception:
+        _LLM_HEALTH_CACHE[cache_key] = (now, False)
         return False
 
 

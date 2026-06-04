@@ -1,29 +1,39 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useDocumentSummary } from "../../hooks/useDocumentSummary";
 import { useDocumentStore } from "../../stores/document-store";
 import { LoadingSpinner } from "../common/LoadingSpinner";
-
-const DETAIL_LEVELS = [
-  { value: "brief", label: "Brief", desc: "Quick overview" },
-  { value: "standard", label: "Standard", desc: "Balanced summary" },
-  { value: "detailed", label: "Detailed", desc: "In-depth analysis" },
-] as const;
 
 export function DocumentSummary() {
   const language = useDocumentStore((s) => s.language);
   const results = useDocumentStore((s) => s.results);
   const { mutate, data, isPending, error, reset } = useDocumentSummary();
   const [selectedDoc, setSelectedDoc] = useState<string>("");
-  const [detailLevel, setDetailLevel] = useState<"brief" | "standard" | "detailed">("standard");
 
   const completedDocs = results.filter(
-    (r) => r.status === "completed" && r.extracted_text
+    (r) => r.status === "completed" && r.raw_text
   );
+  const activeDoc = completedDocs.find((doc) => doc.file_id === selectedDoc) ?? completedDocs[0] ?? null;
+
+  useEffect(() => {
+    if (completedDocs.length === 0) {
+      setSelectedDoc("");
+      return;
+    }
+
+    const firstDoc = completedDocs[0];
+    if (!selectedDoc || !completedDocs.some((doc) => doc.file_id === selectedDoc)) {
+      setSelectedDoc(firstDoc.file_id);
+    }
+  }, [completedDocs, selectedDoc]);
+
+  useEffect(() => {
+    if (!activeDoc?.raw_text) return;
+    mutate({ documentText: activeDoc.raw_text, language, detailLevel: "standard" });
+  }, [activeDoc?.file_id, activeDoc?.raw_text, language, mutate]);
 
   const handleSummarize = () => {
-    const doc = completedDocs.find((d) => d.file_id === selectedDoc);
-    if (!doc?.extracted_text) return;
-    mutate({ documentText: doc.extracted_text, language, detailLevel });
+    if (!activeDoc?.raw_text) return;
+    mutate({ documentText: activeDoc.raw_text, language, detailLevel: "standard" });
   };
 
   return (
@@ -61,33 +71,12 @@ export function DocumentSummary() {
                 title="Select a document to summarize"
               >
                 <option value="">Select a document…</option>
-                {completedDocs.map((doc) => (
-                  <option key={doc.file_id} value={doc.file_id}>
-                    {doc.filename}
-                  </option>
-                ))}
+                  {completedDocs.map((doc, index) => (
+                    <option key={doc.file_id} value={doc.file_id}>
+                      Document {index + 1}
+                    </option>
+                  ))}
               </select>
-            </div>
-
-            {/* Detail Level Selector */}
-            <div>
-              <p className="text-xs font-body text-sepia-500 mb-2">Detail Level</p>
-              <div className="flex gap-2">
-                {DETAIL_LEVELS.map((level) => (
-                  <button
-                    key={level.value}
-                    onClick={() => setDetailLevel(level.value)}
-                    className={`flex-1 px-3 py-2.5 rounded-lg border text-sm font-body transition-all duration-200 ${
-                      detailLevel === level.value
-                        ? "bg-legal-brown text-parchment-50 border-legal-brown shadow-parchment"
-                        : "bg-parchment-50 text-sepia-600 border-sepia-200 hover:border-legal-gold/50"
-                    }`}
-                  >
-                    <span className="font-semibold block">{level.label}</span>
-                    <span className="text-xs opacity-75">{level.desc}</span>
-                  </button>
-                ))}
-              </div>
             </div>
 
             <button
