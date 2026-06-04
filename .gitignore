@@ -27,6 +27,8 @@ Thumbs.db
 # Backend
 backend/uploads/
 backend/.pytest_cache/
+backend/.env.example
+backend/.env
 
 # Frontend
 frontend/node_modules/
