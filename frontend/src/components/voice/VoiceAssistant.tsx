@@ -18,8 +18,10 @@ export function VoiceAssistant() {
   const startListening = useCallback(() => {
     if (!isSupported) return;
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) return;
+
+    const recognition = new SpeechRecognitionCtor();
     recognition.lang = language === "hi" ? "hi-IN" : "en-IN";
     recognition.interimResults = true;
     recognition.continuous = false;
